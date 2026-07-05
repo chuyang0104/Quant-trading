@@ -74,13 +74,14 @@ def set_monitor(monitor):
 
 # ==================== 辅助函数（延迟导入） ====================
 
-def _get_mt5():
-    """延迟导入MT5模块"""
-    try:
-        import MetaTrader5 as mt5
-        return mt5
-    except ImportError:
-        return None
+# 全局连接器实例（由main.py通过set_connector设置）
+_connector_instance = None
+
+
+def set_connector(connector):
+    """设置全局连接器实例（由main.py调用）"""
+    global _connector_instance
+    _connector_instance = connector
 
 
 def _get_data_fetcher():
@@ -155,12 +156,11 @@ async def get_account():
     获取账户信息
     返回: 余额、净值、可用保证金、持仓盈亏等
     """
-    mt5 = _get_mt5()
-    if not mt5 or not mt5.initialize():
-        raise HTTPException(status_code=503, detail="MT5未连接")
+    if not _connector_instance or not _connector_instance.is_connected:
+        raise HTTPException(status_code=503, detail="交易平台未连接")
 
     try:
-        account = mt5.account_info()
+        account = _connector_instance.account_info()
         if account is None:
             raise HTTPException(status_code=503, detail="无法获取账户信息")
 
@@ -172,7 +172,7 @@ async def get_account():
                 "balance": account.balance,
                 "equity": account.equity,
                 "margin": account.margin,
-                "margin_free": account.margin_free,
+                "margin_free": account.free_margin,
                 "margin_level": account.margin_level if account.margin > 0 else 0,
                 "profit": account.profit,
                 "currency": account.currency
@@ -189,12 +189,11 @@ async def get_positions():
     """
     获取当前持仓列表
     """
-    mt5 = _get_mt5()
-    if not mt5 or not mt5.initialize():
-        raise HTTPException(status_code=503, detail="MT5未连接")
+    if not _connector_instance or not _connector_instance.is_connected:
+        raise HTTPException(status_code=503, detail="交易平台未连接")
 
     try:
-        positions = mt5.positions_get()
+        positions = _connector_instance.positions_get()
         if positions is None:
             positions = []
 
@@ -204,7 +203,7 @@ async def get_positions():
                 "ticket": pos.ticket,
                 "symbol": pos.symbol,
                 "type": pos.type,
-                "type_str": "BUY" if pos.type == mt5.POSITION_TYPE_BUY else "SELL",
+                "type_str": "BUY" if pos.type == 0 else "SELL",
                 "volume": pos.volume,
                 "price_open": pos.price_open,
                 "price_current": pos.price_current,
@@ -212,7 +211,6 @@ async def get_positions():
                 "tp": pos.tp,
                 "profit": pos.profit,
                 "comment": pos.comment,
-                "magic": pos.magic,
             })
 
         return {
@@ -485,17 +483,16 @@ async def get_monitor_status():
 @app.get("/api/health")
 async def health_check():
     """健康检查接口"""
-    mt5 = _get_mt5()
-    mt5_connected = False
-    if mt5:
+    platform_connected = False
+    if _connector_instance:
         try:
-            mt5_connected = mt5.initialize()
+            platform_connected = _connector_instance.is_connected
         except:
             pass
 
     return {
-        "status": "healthy" if mt5_connected else "degraded",
-        "mt5_connected": mt5_connected,
+        "status": "healthy" if platform_connected else "degraded",
+        "platform_connected": platform_connected,
         "monitor_running": _monitor_instance is not None and _monitor_instance.is_running,
         "timestamp": datetime.now().isoformat()
     }

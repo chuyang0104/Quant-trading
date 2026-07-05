@@ -19,6 +19,12 @@ logger = logging.getLogger(__name__)
 class Settings(BaseModel):
     """全局配置类 - 系统所有配置参数的单一来源"""
 
+    # ==================== 交易平台配置 ====================
+    platform: str = Field(
+        default="mt5",
+        description="交易平台类型: mt4 或 mt5"
+    )
+
     # ==================== MT5 配置 ====================
     mt5_path: str = Field(
         default=r"D:\交易盘\DLSM MT5\terminal64.exe",

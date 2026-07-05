@@ -1,8 +1,8 @@
 """
-实时监控模块
+实时监控模块 - 统一连接器接口
 
 提供账户状态、持仓信息的实时监控功能。
-在后台线程中定期采集MT5数据，提供统一的状态查询接口。
+在后台线程中定期采集数据，提供统一的状态查询接口。
 """
 
 import threading
@@ -13,11 +13,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from collections import defaultdict
 
-try:
-    import MetaTrader5 as mt5
-except ImportError:
-    mt5 = None
-    logging.warning("MetaTrader5 库未安装")
+from core.connector_base import BaseConnector, AccountInfo, PositionInfo
+from core.connector_factory import create_connector
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -47,34 +45,12 @@ class PositionDetail:
     comment: str = ""
 
 
-@dataclass
-class AccountInfo:
-    """
-    账户信息
-
-    Attributes:
-        balance: 余额
-        equity: 净值
-        margin: 已用保证金
-        free_margin: 可用保证金
-        margin_level: 保证金水平
-        profit: 浮动盈亏
-        currency: 账户货币
-    """
-    balance: float
-    equity: float
-    margin: float
-    free_margin: float
-    margin_level: float
-    profit: float
-    currency: str = "USD"
-
-
 class Monitor:
     """
-    实时监控器
+    实时监控器 - 统一接口
 
-    在后台线程中定期采集MT5数据，提供统一的状态查询接口。
+    在后台线程中定期采集平台数据，提供统一的状态查询接口。
+    通过 BaseConnector 接口支持 MT4/MT5 等平台。
 
     监控内容：
     - 账户信息（余额、净值、保证金等）
@@ -83,22 +59,41 @@ class Monitor:
     - 监控运行状态
 
     Attributes:
+        connector: 平台连接器实例
         interval_seconds: 数据采集间隔（秒）
         is_running: 监控是否正在运行
-        connection_ok: MT5连接是否正常
+        connection_ok: 连接是否正常
     """
 
-    def __init__(self, interval_seconds: int = 5):
+    def __init__(
+        self,
+        connector: Optional[BaseConnector] = None,
+        interval_seconds: int = 5
+    ):
         """
         初始化监控器
 
         Args:
+            connector: 平台连接器，None 时自动创建
             interval_seconds: 数据采集间隔，默认5秒
         """
         self.interval_seconds = interval_seconds
         self._is_running = False
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+
+        # 创建或使用传入的连接器
+        if connector is None:
+            # 使用配置的平台类型创建连接器
+            platform = settings.platform
+            if platform == "mt5":
+                self.connector = create_connector("mt5", path=settings.mt5_path)
+            elif platform == "mt4":
+                self.connector = create_connector("mt4")
+            else:
+                raise ValueError(f"不支持的平台类型: {platform}")
+        else:
+            self.connector = connector
 
         # 数据缓存
         self._account_info: Optional[AccountInfo] = None
@@ -128,10 +123,6 @@ class Monitor:
         """
         if self._is_running:
             logger.warning("监控器已在运行中")
-            return False
-
-        if mt5 is None:
-            logger.error("MetaTrader5 库未安装，无法启动监控")
             return False
 
         self._is_running = True
@@ -172,7 +163,7 @@ class Monitor:
         """
         监控线程主循环
 
-        定期采集MT5数据并更新缓存。
+        定期采集数据并更新缓存。
         """
         logger.info("监控线程开始运行")
 
@@ -190,34 +181,25 @@ class Monitor:
 
     def _collect_data(self) -> None:
         """
-        采集MT5数据并更新缓存
+        采集数据并更新缓存
 
         包括账户信息和持仓信息。
         """
         # 检查连接状态
-        if not mt5.initialize():
-            self._connection_ok = False
-            logger.error("MT5连接失败")
+        self._connection_ok = self.connector.is_connected
+
+        if not self._connection_ok:
+            logger.error("交易平台连接失败")
             return
 
-        self._connection_ok = True
-
         # 获取账户信息
-        account = mt5.account_info()
+        account = self.connector.account_info()
         if account is None:
             logger.error("无法获取账户信息")
             return
 
-        # 转换为AccountInfo
-        self._account_info = AccountInfo(
-            balance=account.balance,
-            equity=account.equity,
-            margin=account.margin,
-            free_margin=account.margin_free,
-            margin_level=account.margin_level if account.margin > 0 else 0,
-            profit=account.profit,
-            currency=account.currency
-        )
+        # 缓存账户信息
+        self._account_info = account
 
         # 记录净值历史
         self._equity_history.append(account.equity)
@@ -237,26 +219,13 @@ class Monitor:
         self._previous_equity = account.equity
 
         # 获取持仓信息
-        positions = mt5.positions_get()
-        if positions is None:
+        positions = self.connector.positions_get()
+        if not positions:
             self._positions = []
             self._position_count = 0
         else:
             self._position_count = len(positions)
-            self._positions = []
-            for pos in positions:
-                self._positions.append({
-                    "ticket": pos.ticket,
-                    "symbol": pos.symbol,
-                    "type": pos.type,  # 0=BUY, 1=SELL
-                    "volume": pos.volume,
-                    "price_open": pos.price_open,
-                    "price_current": pos.price_current,
-                    "profit": pos.profit,
-                    "comment": pos.comment,
-                    "sl": pos.sl,
-                    "tp": pos.tp
-                })
+            self._positions = [pos.to_dict() for pos in positions]
 
         self._last_update = datetime.now()
 
@@ -275,7 +244,7 @@ class Monitor:
         - 保证金水平过低
         """
         if not self._connection_ok:
-            self._trigger_alert("MT5连接断开")
+            self._trigger_alert("交易平台连接断开")
             return
 
         if self._account_info:
@@ -327,13 +296,16 @@ class Monitor:
 
         if self._account_info:
             status["account"] = {
+                "login": self._account_info.login,
+                "server": self._account_info.server,
                 "balance": self._account_info.balance,
                 "equity": self._account_info.equity,
                 "margin": self._account_info.margin,
                 "free_margin": self._account_info.free_margin,
                 "margin_level": self._account_info.margin_level,
                 "profit": self._account_info.profit,
-                "currency": self._account_info.currency
+                "currency": self._account_info.currency,
+                "leverage": self._account_info.leverage
             }
 
         return status
@@ -349,13 +321,16 @@ class Monitor:
             return None
 
         return {
+            "login": self._account_info.login,
+            "server": self._account_info.server,
             "balance": self._account_info.balance,
             "equity": self._account_info.equity,
             "margin": self._account_info.margin,
             "free_margin": self._account_info.free_margin,
             "margin_level": self._account_info.margin_level,
             "profit": self._account_info.profit,
-            "currency": self._account_info.currency
+            "currency": self._account_info.currency,
+            "leverage": self._account_info.leverage
         }
 
     def get_positions(self) -> List[Dict[str, Any]]:
@@ -382,22 +357,12 @@ class Monitor:
 
     def check_connection(self) -> bool:
         """
-        检查MT5连接状态
+        检查连接状态
 
         Returns:
             bool: 连接是否正常
         """
-        if mt5 is None:
-            return False
-
-        try:
-            connected = mt5.initialize()
-            self._connection_ok = connected
-            return connected
-        except Exception as e:
-            logger.error(f"检查MT5连接时异常: {e}")
-            self._connection_ok = False
-            return False
+        return self.connector.is_connected
 
     def get_equity_history(self) -> List[float]:
         """
@@ -433,7 +398,7 @@ class Monitor:
 
     @property
     def connection_ok(self) -> bool:
-        """MT5连接是否正常"""
+        """连接是否正常"""
         return self._connection_ok
 
     @property
@@ -449,4 +414,4 @@ class Monitor:
 
 
 # 导出
-__all__ = ["Monitor", "AccountInfo", "PositionDetail"]
+__all__ = ["Monitor", "PositionDetail"]

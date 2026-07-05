@@ -1,8 +1,12 @@
 # data/data_fetcher.py
 """
-MT5 行情数据获取模块
+行情数据获取模块
 
-提供从 MetaTrader 5 获取行情数据的接口，包括:
+通过统一的平台连接器(BaseConnector)获取行情数据，支持:
+- MT5: MetaTrader 5
+- MT4: MetaTrader 4 (通过ZeroMQ桥接)
+
+提供:
 - K线数据 (OHLCV)
 - Tick 数据 (实时报价)
 - 品种信息 (交易规则)
@@ -15,79 +19,87 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-try:
-    import MetaTrader5 as mt5
-except ImportError:
-    raise ImportError(
-        "未安装 MetaTrader5 库，请运行: pip install MetaTrader5"
-    )
-
 from core.base_classes import BaseDataSource
-from core.mt5_connector import get_connector
+from core.connector_base import BaseConnector
+from core.connector_factory import create_connector
 
 logger = logging.getLogger(__name__)
 
 
 class DataFetcher(BaseDataSource):
     """
-    MT5 行情数据获取器
+    行情数据获取器
 
-    继承 BaseDataSource，实现从 MT5 获取 K线和Tick数据。
-    所有方法在调用前会自动检查并确保 MT5 连接状态。
+    通过平台连接器获取K线、Tick和品种信息。
+    自动适配MT4/MT5，调用方无需关心底层平台差异。
+
+    所有方法在调用前会自动检查并确保连接器已连接。
     """
 
-    # 时间周期映射表
-    TIMEFRAME_MAP: Dict[str, int] = {
-        "M1": mt5.TIMEFRAME_M1,
-        "M5": mt5.TIMEFRAME_M5,
-        "M15": mt5.TIMEFRAME_M15,
-        "M30": mt5.TIMEFRAME_M30,
-        "H1": mt5.TIMEFRAME_H1,
-        "H4": mt5.TIMEFRAME_H4,
-        "D1": mt5.TIMEFRAME_D1,
-        "W1": mt5.TIMEFRAME_W1,
-        "MN1": mt5.TIMEFRAME_MN1,
-    }
+    # 支持的时间周期
+    SUPPORTED_TIMEFRAMES = [
+        "M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1", "MN1"
+    ]
 
-    def __init__(self, mt5_path: Optional[str] = None):
+    def __init__(self, connector: Optional[BaseConnector] = None):
         """
         初始化数据获取器
 
         Args:
-            mt5_path: MT5 terminal64.exe 的完整路径，为 None 时使用默认路径
+            connector: 平台连接器实例(BaseConnector)。
+                      为None时根据config.settings.platform自动创建。
         """
-        self._connector = get_connector(path=mt5_path)
-        logger.info("DataFetcher 初始化完成")
+        if connector is not None:
+            self._connector = connector
+        else:
+            # 根据配置自动创建连接器
+            from config.settings import settings
+            platform = settings.platform
+            if platform == "mt5":
+                self._connector = create_connector("mt5", path=settings.mt5_path)
+            elif platform == "mt4":
+                self._connector = create_connector(
+                    "mt4",
+                    zmq_host=settings.mt4_zmq_host,
+                    push_host=settings.mt4_zmq_push_host,
+                )
+            else:
+                raise ValueError(f"不支持的平台: {platform}")
+
+        logger.info(f"DataFetcher 初始化完成, 平台: {self.__class__.__name__}")
 
     def _ensure_connection(self) -> bool:
         """
-        确保 MT5 连接状态
+        确保平台连接状态
 
         Returns:
             bool: 连接是否正常
         """
-        return self._connector.ensure_connected()
+        if not self._connector.is_connected:
+            logger.info("连接器未连接，尝试初始化...")
+            return self._connector.initialize()
+        return True
 
-    def _parse_timeframe(self, timeframe: str) -> int:
+    def _validate_timeframe(self, timeframe: str) -> str:
         """
-        解析时间周期字符串为 MT5 常量
+        验证时间周期是否有效
 
         Args:
             timeframe: 时间周期字符串，如 "M1", "H1", "D1"
 
         Returns:
-            int: MT5 时间周期常量
+            str: 大写的时间周期字符串
 
         Raises:
             ValueError: 不支持的时间周期
         """
         timeframe_upper = timeframe.upper()
-        if timeframe_upper not in self.TIMEFRAME_MAP:
+        if timeframe_upper not in self.SUPPORTED_TIMEFRAMES:
             raise ValueError(
                 f"不支持的时间周期: {timeframe}，"
-                f"支持的周期: {list(self.TIMEFRAME_MAP.keys())}"
+                f"支持的周期: {self.SUPPORTED_TIMEFRAMES}"
             )
-        return self.TIMEFRAME_MAP[timeframe_upper]
+        return timeframe_upper
 
     def get_rates(
         self,
@@ -114,39 +126,22 @@ class DataFetcher(BaseDataSource):
             - spread: 点差
 
         Raises:
-            ConnectionError: MT5 未连接
+            ConnectionError: 平台未连接
             ValueError: 获取数据失败
         """
         if not self._ensure_connection():
-            raise ConnectionError("MT5 未连接，无法获取数据")
+            raise ConnectionError("平台未连接，无法获取数据")
 
-        mt5_timeframe = self._parse_timeframe(timeframe)
+        tf = self._validate_timeframe(timeframe)
 
         try:
-            # 调用 MT5 API 获取数据
-            rates = mt5.copy_rates_from_pos(
-                symbol,
-                mt5_timeframe,
-                0,  # 从最新位置开始
-                count
-            )
+            df = self._connector.copy_rates_from_pos(symbol, tf, 0, count)
 
-            if rates is None or len(rates) == 0:
-                error_code = mt5.last_error()
+            if df is None or df.empty:
                 logger.warning(
-                    f"未获取到数据，品种={symbol}, 周期={timeframe}, "
-                    f"错误={error_code}"
+                    f"未获取到数据，品种={symbol}, 周期={timeframe}"
                 )
                 return pd.DataFrame()
-
-            # 转换为 DataFrame
-            df = pd.DataFrame(rates)
-
-            # 将时间戳转换为 datetime
-            df['time'] = pd.to_datetime(df['time'], unit='s')
-
-            # 按时间升序排列
-            df = df.sort_values('time').reset_index(drop=True)
 
             logger.debug(
                 f"获取K线数据成功: {symbol} {timeframe}, "
@@ -169,6 +164,9 @@ class DataFetcher(BaseDataSource):
         """
         获取指定时间范围的K线数据
 
+        注意: 此方法依赖连接器实现copy_rates_range。
+        如果连接器不支持，将回退到获取大量数据后过滤。
+
         Args:
             symbol: 交易品种代码
             timeframe: 时间周期
@@ -179,29 +177,29 @@ class DataFetcher(BaseDataSource):
             pandas.DataFrame: K线数据，格式同 get_rates()
         """
         if not self._ensure_connection():
-            raise ConnectionError("MT5 未连接，无法获取数据")
+            raise ConnectionError("平台未连接，无法获取数据")
 
-        mt5_timeframe = self._parse_timeframe(timeframe)
+        tf = self._validate_timeframe(timeframe)
 
         try:
-            # MT5 使用 UTC 时间，需要转换
-            rates = mt5.copy_rates_range(
-                symbol,
-                mt5_timeframe,
-                start_dt,
-                end_dt
-            )
+            # 尝试调用连接器的copy_rates_range（如果支持）
+            if hasattr(self._connector, 'copy_rates_range'):
+                df = self._connector.copy_rates_range(
+                    symbol, tf, start_dt, end_dt
+                )
+            else:
+                # 回退方案: 获取大量数据后按时间过滤
+                # 估算需要的bar数（保守估计）
+                df = self._connector.copy_rates_from_pos(symbol, tf, 0, 5000)
+                if df is not None and not df.empty:
+                    df = df[(df['time'] >= start_dt) & (df['time'] <= end_dt)]
 
-            if rates is None or len(rates) == 0:
+            if df is None or df.empty:
                 logger.warning(
                     f"未获取到数据，品种={symbol}, 周期={timeframe}, "
                     f"时间范围={start_dt} ~ {end_dt}"
                 )
                 return pd.DataFrame()
-
-            df = pd.DataFrame(rates)
-            df['time'] = pd.to_datetime(df['time'], unit='s')
-            df = df.sort_values('time').reset_index(drop=True)
 
             logger.debug(
                 f"获取范围K线成功: {symbol} {timeframe}, "
@@ -230,29 +228,19 @@ class DataFetcher(BaseDataSource):
             - time: 更新时间
 
         Raises:
-            ConnectionError: MT5 未连接
-            ValueError: 获取数据失败
+            ConnectionError: 平台未连接
         """
         if not self._ensure_connection():
-            raise ConnectionError("MT5 未连接，无法获取数据")
+            raise ConnectionError("平台未连接，无法获取数据")
 
         try:
-            tick = mt5.symbol_info_tick(symbol)
+            tick = self._connector.symbol_info_tick(symbol)
 
             if tick is None:
-                error_code = mt5.last_error()
-                logger.warning(
-                    f"未获取到Tick数据，品种={symbol}, 错误={error_code}"
-                )
+                logger.warning(f"未获取到Tick数据，品种={symbol}")
                 return {}
 
-            return {
-                'bid': tick.bid,
-                'ask': tick.ask,
-                'last': tick.last,
-                'volume': tick.volume,
-                'time': datetime.fromtimestamp(tick.time) if tick.time > 0 else None
-            }
+            return tick
 
         except Exception as e:
             logger.error(f"获取Tick数据失败: {e}", exc_info=True)
@@ -267,38 +255,34 @@ class DataFetcher(BaseDataSource):
 
         Returns:
             dict 包含:
+            - name: 品种名称
             - point: 最小价格变动单位
             - digits: 小数位数
             - volume_min: 最小交易量
             - volume_max: 最大交易量
             - volume_step: 交易量步长
-            - trade_contract_size: 合约规模
-            - currency_base: 基础货币
-            - currency_profit: 利润货币
-            - description: 品种描述
+            - contract_size: 合约规模
+            - bid: 买价
+            - ask: 卖价
+            - spread: 点差
         """
         if not self._ensure_connection():
-            raise ConnectionError("MT5 未连接，无法获取数据")
+            raise ConnectionError("平台未连接，无法获取数据")
 
         try:
-            info = mt5.symbol_info(symbol)
+            info = self._connector.symbol_info(symbol)
 
             if info is None:
                 logger.warning(f"未获取到品种信息: {symbol}")
                 return {}
 
-            return {
-                'name': info.name,
-                'description': info.description,
-                'point': info.point,
-                'digits': info.digits,
-                'volume_min': info.volume_min,
-                'volume_max': info.volume_max,
-                'volume_step': info.volume_step,
-                'trade_contract_size': info.trade_contract_size,
-                'currency_base': info.currency_base,
-                'currency_profit': info.currency_profit,
-            }
+            # 转换为dict返回
+            if hasattr(info, '__dict__'):
+                return {k: v for k, v in info.__dict__.items()}
+            elif hasattr(info, '_asdict'):
+                return info._asdict()
+            else:
+                return dict(info)
 
         except Exception as e:
             logger.error(f"获取品种信息失败: {e}", exc_info=True)
@@ -315,24 +299,18 @@ class DataFetcher(BaseDataSource):
             List[str]: 品种代码列表
         """
         if not self._ensure_connection():
-            raise ConnectionError("MT5 未连接，无法获取数据")
+            raise ConnectionError("平台未连接，无法获取数据")
 
         try:
-            symbols = mt5.symbols_get()
+            symbols = self._connector.symbols_get(pattern)
 
-            if symbols is None:
+            if not symbols:
                 logger.warning("未获取到品种列表")
                 return []
 
-            # 筛选可见品种
-            visible_symbols = [
-                s.name for s in symbols
-                if s.visible and (pattern == "" or pattern.lower() in s.name.lower())
-            ]
+            logger.debug(f"获取品种列表成功，数量={len(symbols)}")
 
-            logger.debug(f"获取品种列表成功，数量={len(visible_symbols)}")
-
-            return visible_symbols
+            return symbols
 
         except Exception as e:
             logger.error(f"获取品种列表失败: {e}", exc_info=True)
@@ -344,7 +322,7 @@ def fetch_rates(
     symbol: str,
     timeframe: str,
     count: int = 500,
-    mt5_path: Optional[str] = None
+    connector: Optional[BaseConnector] = None
 ) -> pd.DataFrame:
     """
     便捷函数：获取K线数据
@@ -353,54 +331,10 @@ def fetch_rates(
         symbol: 交易品种
         timeframe: 时间周期
         count: K线数量
-        mt5_path: MT5路径
+        connector: 平台连接器(可选)
 
     Returns:
         K线数据DataFrame
     """
-    fetcher = DataFetcher(mt5_path=mt5_path)
+    fetcher = DataFetcher(connector=connector)
     return fetcher.get_rates(symbol, timeframe, count)
-
-
-if __name__ == "__main__":
-    # 配置日志用于测试
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-
-    print("=" * 50)
-    print("DataFetcher 测试")
-    print("=" * 50)
-
-    # 创建数据获取器
-    fetcher = DataFetcher()
-
-    # 确保连接
-    if fetcher._ensure_connection():
-        # 测试获取K线
-        print("\n1. 测试获取K线数据...")
-        df = fetcher.get_rates("XAUUSD", "H1", count=10)
-        if not df.empty:
-            print(df.head())
-            print(f"数据形状: {df.shape}")
-            print(f"列名: {list(df.columns)}")
-
-        # 测试获取Tick
-        print("\n2. 测试获取Tick数据...")
-        tick = fetcher.get_tick("XAUUSD")
-        if tick:
-            print(f"买价: {tick.get('bid')}, 卖价: {tick.get('ask')}")
-
-        # 测试获取品种信息
-        print("\n3. 测试获取品种信息...")
-        info = fetcher.get_symbol_info("XAUUSD")
-        if info:
-            print(f"品种信息: {info}")
-
-        # 测试获取可用品种
-        print("\n4. 测试获取可用品种...")
-        symbols = fetcher.get_available_symbols("USD")
-        print(f"包含USD的品种数量: {len(symbols)}")
-        if symbols:
-            print(f"前5个: {symbols[:5]}")
