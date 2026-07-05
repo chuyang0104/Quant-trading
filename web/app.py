@@ -142,7 +142,11 @@ def _get_trade_executor():
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     """主页面"""
-    return templates.TemplateResponse("index.html", {"request": request})
+    # 直接读取HTML文件返回，避免Jinja2模板渲染问题
+    import os
+    html_path = os.path.join(os.path.dirname(__file__), "templates", "index.html")
+    with open(html_path, "r", encoding="utf-8") as f:
+        return HTMLResponse(content=f.read())
 
 
 @app.get("/api/account")

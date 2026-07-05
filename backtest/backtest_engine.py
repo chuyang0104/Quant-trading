@@ -11,7 +11,7 @@ import pandas as pd
 import numpy as np
 import logging
 
-from backtest import metrics
+from backtest import metrics as metrics
 
 logger = logging.getLogger(__name__)
 
@@ -198,10 +198,11 @@ class BacktestEngine:
                     current_trade.pnl_pct = (current_trade.pnl / capital_in_trade) * 100
 
                     capital += current_trade.pnl
-                    trades.append(current_trade)
+                    closed_trade = current_trade
+                    trades.append(closed_trade)
                     current_trade = None
 
-                    logger.debug(f"{bar_time} {exit_reason}: 平仓价={exit_price:.5f}, 盈亏={current_trade.pnl:.2f}")
+                    logger.debug(f"{bar_time} {exit_reason}: 平仓价={exit_price:.5f}, 盈亏={closed_trade.pnl:.2f}")
 
             # 开仓逻辑
             if current_trade is None and signal == 1:
